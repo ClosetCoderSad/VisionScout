@@ -24,21 +24,20 @@ def get_detections():
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run a YOLO backend server.")
-    # --- MODIFICATION: Add the new 'wall_quality_api' mode ---
     parser.add_argument(
-        '--mode', type=str, default='wall_quality', 
-        choices=['wall_quality', 'car_damage_yolo11m', 'general', 'wall_quality_api'],
+        '--mode', type=str, default='general', 
+        # --- CLEANUP: Removed the redundant 'wall_quality' local mode ---
+        choices=['car_damage_yolo11m', 'general', 'wall_quality_api'],
         help="The detection mode to use. 'wall_quality_api' uses the Roboflow hosted API."
     )
     parser.add_argument('--port', type=int, default=5000, help="Port to run the API server on.")
     args = parser.parse_args()
 
-    # --- MODIFICATION: Conditionally load the model ---
     model = None
     if args.mode != 'wall_quality_api':
+        # --- CLEANUP: Removed the 'wall_quality.pt' entry ---
         MODEL_MAP = {
             'general': 'yolov8n.pt',
-            'wall_quality': 'wall_quality.pt',
             'car_damage_yolo11m': 'yolo11m_car_damage.pt'
         }
         selected_model_file = MODEL_MAP[args.mode]
@@ -51,9 +50,6 @@ if __name__ == '__main__':
             exit()
     else:
         print(f"Main thread: Running in '{args.mode}' mode. No local model will be loaded.")
-
-    # --- Start Background Threads ---
-    # --- MODIFICATION: Pass the 'mode' to the processing thread ---
     processing_thread = threading.Thread(target=video_processing_thread, args=(args.mode, model), daemon=True)
     processing_thread.start()
 
