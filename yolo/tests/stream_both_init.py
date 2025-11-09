@@ -138,62 +138,100 @@ class StreamReceiver:
         self.running = False
 
 
-def connect_devices(ssid: str, password: str) -> List[DeviceController]:
-    """Connect to both devices and ensure they're on WiFi."""
-    controllers = []
+def connect_wifi(controllers: List[DeviceController], ssid: str, password: str) -> bool:
+    """Connect both devices to WiFi. Return True if both connected successfully."""
     try:
-        # 1. Serial device first (known to work in this order)
-        print("Connecting to serial device...")
-        s = SerialVoxelTransport(SERIAL_PORT, baudrate=115200, timeout=35.0)  # Long timeout for WiFi
-        s.connect()
-        serial_ctrl = DeviceController(s)
-        controllers.append(serial_ctrl)
-        
-        # Connect serial device to WiFi - expect progress messages
-        print("Connecting serial device to WiFi...")
-        res = serial_ctrl.execute_device_command(f'connectWifi:{ssid}|{password}')
-        print("Serial WiFi result:", res)
-        if isinstance(res, dict):
-            raw = res.get('raw_response', '')
-            if isinstance(raw, str) and 'Attempting to connect' in raw:
-                print("Serial device attempting WiFi connection...")
-                # Give it time to complete
-                time.sleep(5)
-
-        # 2. Then BLE device
-        print("\nScanning for BLE device...")
-        b = BleVoxelTransport(device_name=BLE_NAME)
-        b.connect("")
-        ble_ctrl = DeviceController(b)
-        controllers.append(ble_ctrl)
-        
-        # Connect BLE device to WiFi
-        print("Connecting BLE device to WiFi...")
-        res = ble_ctrl.execute_device_command(f'connectWifi:{ssid}|{password}')
-        print("BLE WiFi result:", res)
-        
-        # If BLE device connected successfully, assume serial also worked
-        if isinstance(res, dict) and res.get('status') == 'success':
-            print("BLE device connected. Waiting 2s for both devices to stabilize...")
-            time.sleep(2)
-            return controllers
-        else:
-            raise Exception("BLE device WiFi connection failed")
-
-    except Exception as e:
-        print(f"Error connecting devices: {e}")
-        # Clean up any successful connections
-        for c in controllers:
+        # First, get our host's network info to ensure we're on same subnet
+        host_ip = None
+        try:
+            # Try to get IP by connecting to a public DNS
+            temp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            temp_sock.connect(("8.8.8.8", 80))
+            host_ip = temp_sock.getsockname()[0]
+            temp_sock.close()
+            print(f"Host IP: {host_ip}")
+        except Exception as e:
+            print(f"Warning: Could not determine host IP: {e}")
+            
+        for i, ctrl in enumerate(controllers):
+            print(f"\nConnecting device #{i+1} to WiFi...")
+            
+            # First try disconnecting to clear any stale connections
             try:
-                c.disconnect()
+                ctrl.execute_device_command('wifi_client_disconnect')
+                time.sleep(1)
             except Exception:
                 pass
-        raise
+                
+            # Connect to WiFi
+            res = ctrl.execute_device_command(f'wifi_client_connect:{ssid}|{password}')
+            print(f"WiFi result:", res)
+            
+            if isinstance(res, dict):
+                if res.get('error'):
+                    print(f"Error connecting device #{i+1} to WiFi")
+                    return False
+                elif res.get('ip'):
+                    dev_ip = res.get('ip')
+                    print(f"Device #{i+1} got IP: {dev_ip}")
+                    if host_ip:
+                        print(f"Host IP: {host_ip}")
+                        host_parts = host_ip.split('.')
+                        dev_parts = dev_ip.split('.')
+                        if host_parts[:2] != dev_parts[:2]:
+                            print(f"Warning: Device #{i+1} ({dev_ip}) appears to be on different subnet than host ({host_ip})")
+            
+            time.sleep(3)  # Give WiFi more time to establish
+            
+            # Verify connection with status check
+            status = ctrl.execute_device_command('wifi_client_status')
+            print(f"WiFi status:", status)
+            if isinstance(status, dict) and status.get('error'):
+                print(f"Device #{i+1} WiFi status check failed")
+                return False
+                
+        return True
+    except Exception as e:
+        print(f"Error connecting to WiFi: {e}")
+        return False
 
+
+def get_network_info() -> dict:
+    """Get network information including host IP and gateway."""
+    info = {'host_ip': None, 'gateway': None}
+    
+    try:
+        # Get host IP
+        temp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        temp_sock.connect(("8.8.8.8", 80))
+        info['host_ip'] = temp_sock.getsockname()[0]
+        temp_sock.close()
+        
+        # Try to get gateway
+        import subprocess
+        if sys.platform == "darwin":  # macOS
+            try:
+                result = subprocess.run(['netstat', '-nr'], capture_output=True, text=True)
+                for line in result.stdout.split('\n'):
+                    if 'default' in line:
+                        parts = line.split()
+                        if len(parts) > 1:
+                            info['gateway'] = parts[1]
+                            break
+            except Exception as e:
+                print(f"Warning: Could not determine gateway: {e}")
+    except Exception as e:
+        print(f"Warning: Could not determine network info: {e}")
+    
+    return info
 
 def start_streams(controllers: List[DeviceController]) -> bool:
     """Start streams on both devices. Return True if both started successfully."""
     try:
+        # Get network info first
+        net_info = get_network_info()
+        print(f"\nNetwork info: {net_info}")
+        
         # Start streams on both devices
         for i, ctrl in enumerate(controllers):
             port = STREAM_PORTS[i]
@@ -205,8 +243,55 @@ def start_streams(controllers: List[DeviceController]) -> bool:
                 time.sleep(0.5)
             except Exception:
                 pass
+                
+            # Try IPs in order of likelihood to work
+            ips_to_try = []
+            if net_info['host_ip']:
+                ips_to_try.append(net_info['host_ip'])
+            if net_info['gateway']:
+                ips_to_try.append(net_info['gateway'])
+            ips_to_try.extend(["172.20.10.10", "172.20.10.1", ""])  # Previous working IPs + empty
             
-            # Get our WiFi IP address that devices can reach
+            success = False
+            for ip in ips_to_try:
+                if not ip:
+                    print("Trying default IP (empty string)...")
+                else:
+                    print(f"Trying IP: {ip}")
+                    
+                try:
+                    res = ctrl.execute_device_command(f'rdmp_stream:{ip}|{port}')
+                    print(f"Stream result:", res)
+                    
+                    if i == 0:  # Serial device
+                        raw = str(res.get('raw_response', '')).lower() if isinstance(res, dict) else ''
+                        if not raw or 'camera' in raw:
+                            print("Serial device appears to be starting stream...")
+                            success = True
+                            break
+                    else:  # BLE device
+                        if not (isinstance(res, dict) and res.get('error')):
+                            success = True
+                            break
+                        if 'Failed to connect to remote host' not in str(res.get('error', '')):
+                            print("BLE device error - stopping attempts")
+                            break
+                except Exception as e:
+                    print(f"Error with IP {ip}: {e}")
+                
+                time.sleep(0.5)
+            
+            if not success:
+                print(f"Failed to start stream on device #{i+1}")
+                return False
+        
+        print("\nStreams started - waiting 2s for sockets to open...")
+        time.sleep(2)
+        return True
+        
+    except Exception as e:
+        print(f"Error starting streams: {e}")
+        return False
             host_ip = None
             try:
                 # Try to get IP by connecting to a public DNS
