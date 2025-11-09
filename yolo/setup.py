@@ -1,4 +1,4 @@
-# server.py
+# setup.py
 import argparse
 import threading
 import time

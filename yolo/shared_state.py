@@ -1,31 +1,20 @@
 # shared_state.py
 import threading
-import time
+import numpy as np
 
-# This dictionary holds all our application's data.
+# The lock to ensure thread-safe access.
+lock = threading.Lock()
+
+# This dictionary holds all our application's data for the API.
 detection_data = {
-    "status": "initializing",
-    "summary": {},
-    "detections": {} 
+    "status": "INITIALIZING",  # Can be: CLASSIFYING_CAR, DETECTING_DENTS, ERROR
+    "car_classification": {
+        "label": None,
+        "confidence": 0.0,
+    },
+    "dent_detections": []  # This will be a list of dictionaries for each dent
 }
 
 # This holds the latest frame for the live GUI feed.
-latest_annotated_frame = None
-last_frame_update_time = None
-
-# The lock to ensure thread-safe access to the above variables.
-lock = threading.Lock()
-
-def update_frame(frame):
-    """Thread-safe function to update the latest frame"""
-    global latest_annotated_frame, last_frame_update_time
-    with lock:
-        try:
-            if frame is not None and frame.size > 0:
-                latest_annotated_frame = frame.copy()
-                last_frame_update_time = time.time()
-                print(f"State: Frame updated successfully, shape: {frame.shape}")
-            else:
-                print("State: Warning - Received invalid frame")
-        except Exception as e:
-            print(f"State: Error updating frame: {e}")
+# Initialize with a blank frame to prevent errors on startup.
+latest_annotated_frame = np.zeros((720, 1280, 3), dtype=np.uint8)

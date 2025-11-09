@@ -1,19 +1,17 @@
-# # In video_processor.py
-
+# video_processor.py
 import cv2
-import base64
 import time
 import struct
 import socket
 import numpy as np
-from collections import defaultdict
+from ultralytics import YOLO
 from voxel_sdk.device_controller import DeviceController
 from voxel_sdk.ble import BleVoxelTransport
 
 # Import from our other project files
 import shared_state
 from utils import _recv_exact, get_local_ip
-
+import classifier
 
 def setup_stream_connection(device_name="voxel", stream_port=9000):
     """
@@ -82,126 +80,102 @@ def receive_frame(conn):
     return frame
 
 
-def process_frame_and_update_state(frame, mode, model=None):
-    """
-    Processes a single frame using local YOLO model and updates the shared global state.
-    """
-    # no module-level globals here; we update shared_state directly
-    print(f"Processing frame shape: {frame.shape if frame is not None else 'None'}")
-
-    try:
-        # Process with local YOLO model
-        t0 = time.time()
-        print("Local: Running YOLO detection...")
-        results = model.predict(frame, conf=0.4, iou=0.3, verbose=False)
-        result = results[0]
-        dt = time.time() - t0
-        print(f"Local: Detection completed in {dt*1000:.0f}ms")
-
-        # Get detections and annotate frame
-        boxes = result.boxes
-        annotated_frame = frame.copy()
-        
-        detections_summary = defaultdict(lambda: {"count": 0, "total_conf": 0.0})
-        
-        if boxes is not None and len(boxes) > 0:
-            for box in boxes:
-                # Get box coordinates and convert to int
-                x1, y1, x2, y2 = [int(val) for val in box.xyxy[0]]
-                conf = float(box.conf[0])
-                cls = int(box.cls[0])
-                class_name = result.names[cls]
-                
-                # Draw box and label
-                color = (0, 255, 0)
-                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                label = f"{class_name}: {conf:.2f}"
-                cv2.putText(annotated_frame, label, (x1, y1-10), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                
-                # Update detection summary
-                detections_summary[class_name]["count"] += 1
-                detections_summary[class_name]["total_conf"] += conf
-
-        # Calculate average confidence for each class
-        final_summary = {}
-        for cls, stats in detections_summary.items():
-            final_summary[cls] = {
-                "count": stats["count"],
-                "average_confidence": stats["total_conf"] / stats["count"]
-            }
-
-        # Update shared state
-        print("Local: Updating shared state...")
-        num_boxes = len(boxes) if boxes is not None else 0
-        with shared_state.lock:
-            shared_state.latest_annotated_frame = np.ascontiguousarray(annotated_frame)
-            shared_state.detection_data = {"status": "success", "detections": final_summary}
-            print(f"Local: Frame processed and updated, found {num_boxes} objects")
-
-    except Exception as e:
-        print(f"Error processing frame: {e}")
-        with shared_state.lock:
-            shared_state.detection_data = {"status": "error", "message": str(e)}
-
-
-
-
 def video_processing_thread(mode, model=None, device_name="voxel", stream_port=9000):
     """
-    High-level orchestrator for video processing using local YOLO model.
+    Orchestrator for video processing with a two-stage state machine:
+    1. CLASSIFYING_CAR: Uses a general model to find and classify a car.
+    2. DETECTING_DENTS: Switches to a specialized model for dent detection.
     """
-    # video_processing_thread will update shared_state; no local globals needed
-    transport, fs, conn = None, None, None
-    frame_count = 0
-    last_fps_print = time.time()
-    
-    # Initialize display frame
-    with shared_state.lock:
-        shared_state.latest_annotated_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-        cv2.putText(shared_state.latest_annotated_frame, "Starting up...", (480, 360), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    # --- State Machine and Model Setup ---
+    current_mode = "CLASSIFYING_CAR"
+    car_detection_model = model  # This is the initial model (e.g., yolov8n.pt)
+    dent_detection_model = None  # We will lazy-load this model to save resources.
+    # The 'mode' argument from setup.py now defines the *dent* model path.
+    DENT_MODEL_PATH = 'yolo11m_car_damage.pt' # A sensible default
 
+    transport, fs, conn = None, None, None
+    
     try:
         transport, fs, conn = setup_stream_connection(device_name, stream_port)
+        
         while True:
-            t0 = time.time()
             frame = receive_frame(conn)
-            t_recv = time.time()
             if frame is None:
                 print("Background thread: Stream ended."); break
+
+            annotated_frame = frame.copy()
+
+            # --- MAIN STATE MACHINE LOGIC ---
+            if current_mode == "CLASSIFYING_CAR":
+                with shared_state.lock:
+                    shared_state.detection_data['status'] = 'CLASSIFYING_CAR'
+                
+                results = car_detection_model.predict(frame, conf=0.5, verbose=False)
+                annotated_frame = results[0].plot()
+
+                # Find the first confident 'car' detection
+                for box in results[0].boxes:
+                    class_name = results[0].names[int(box.cls[0])]
+                    if class_name == 'car' and box.conf[0] > 0.75:
+                        print("Processor: Car detected. Cropping and classifying...")
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        car_crop = frame[y1:y2, x1:x2]
+
+                        if car_crop.size > 0:
+                            label, confidence = classifier.classify_image(car_crop)
+                            print(f"Processor: Classification result: {label} ({confidence:.1f}%)")
+
+                            # --- STATE TRANSITION ---
+                            with shared_state.lock:
+                                shared_state.detection_data['car_classification']['label'] = label
+                                shared_state.detection_data['car_classification']['confidence'] = confidence
+                            
+                            print("Processor: --- Switching to DENT DETECTION mode ---")
+                            current_mode = "DETECTING_DENTS"
+                            if dent_detection_model is None:
+                                print(f"Processor: Loading dent detection model from '{DENT_MODEL_PATH}'...")
+                                dent_detection_model = YOLO(DENT_MODEL_PATH)
+                            break # Stop processing other cars in this frame
+
+            elif current_mode == "DETECTING_DENTS":
+                with shared_state.lock:
+                    shared_state.detection_data['status'] = 'DETECTING_DENTS'
+
+                results = dent_detection_model.predict(frame, conf=0.4, iou=0.3, verbose=False)
+                annotated_frame = results[0].plot()
+
+                dent_list = []
+                for box in results[0].boxes:
+                    dent_list.append({
+                        "box": [int(coord) for coord in box.xyxy[0]],
+                        "confidence": float(box.conf[0]),
+                        "class_name": results[0].names[int(box.cls[0])]
+                    })
+                with shared_state.lock:
+                    shared_state.detection_data['dent_detections'] = dent_list
             
-            process_frame_and_update_state(frame, mode, model=model)
-            t_done = time.time()
+            # --- Update display frame with status text ---
+            with shared_state.lock:
+                status_text = f"Mode: {shared_state.detection_data['status']}"
+                car_text = f"Car: {shared_state.detection_data['car_classification']['label']}"
+            cv2.putText(annotated_frame, status_text, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
+            if shared_state.detection_data['car_classification']['label']:
+                 cv2.putText(annotated_frame, car_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
 
-            frame_count += 1
-            if t_done - last_fps_print >= 5.0:
-                fps = frame_count / (t_done - last_fps_print)
-                print(f"FPS: {fps:.1f} (recv: {(t_recv-t0)*1000:.0f}ms, proc: {(t_done-t_recv)*1000:.0f}ms)")
-                frame_count = 0
-                last_fps_print = t_done
-
-            # Brief sleep to prevent CPU overload
-            time.sleep(0.001)
+            # --- Update shared state with the final annotated frame ---
+            with shared_state.lock:
+                shared_state.latest_annotated_frame = np.ascontiguousarray(annotated_frame)
 
     except Exception as e:
         print(f"An error occurred in the background thread: {e}")
         with shared_state.lock:
-            shared_state.detection_data = {"status": "error", "message": str(e), "detections": {}}
+            shared_state.detection_data = {"status": "error", "message": str(e)}
     finally:
+        # (This finally block remains the same as you provided it)
         print("Background thread: Cleaning up...")
-        if conn:
-            conn.close()
-        if fs:
-            fs.stop_rdmp_stream()
+        if conn: conn.close()
+        if fs: fs.stop_rdmp_stream()
         if transport and transport.is_connected():
-            try:
-                transport.disconnect()
-            except RuntimeError as re:
-                # Some Ble implementations try to join the running loop thread from
-                # inside the same thread which raises RuntimeError("cannot join current thread").
-                # Ignore this in cleanup and log it.
-                print(f"Warning: transport.disconnect() raised RuntimeError during cleanup: {re}")
-            except Exception as ex:
-                print(f"Warning: transport.disconnect() failed during cleanup: {ex}")
+            try: transport.disconnect()
+            except Exception as ex: print(f"Warning: transport.disconnect() failed: {ex}")
         print("Background thread: Disconnected and shut down.")
