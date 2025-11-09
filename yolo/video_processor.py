@@ -1,20 +1,17 @@
-# In video_processor.py
+# # In video_processor.py
 
 import cv2
 import base64
 import time
+import struct
 import socket
 import numpy as np
 from collections import defaultdict
 from voxel_sdk.device_controller import DeviceController
 from voxel_sdk.ble import BleVoxelTransport
 
-# --- MODIFIED IMPORTS ---
-from roboflow import Roboflow
-import supervision as sv
-
 # Import from our other project files
-from shared_state import detection_data, latest_annotated_frame, lock
+import shared_state
 from utils import _recv_exact, get_local_ip
 
 
@@ -28,7 +25,8 @@ def setup_stream_connection(device_name="voxel", stream_port=9000):
     transport.connect("")
     
     controller = DeviceController(transport)
-    fs = controller.filesystem = DeviceController(transport).filesystem
+    # transport is already connected; expose the controller filesystem helper
+    fs = controller.filesystem
     print("Helper: Connected.")
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -59,144 +57,137 @@ def receive_frame(conn):
     Receives a single frame payload from the socket and decodes it.
     Returns the OpenCV frame or None if the stream ends.
     """
+    print("Receiving frame header...")
     header = _recv_exact(conn, 8)
-    if not header or header[:4] != b"VXL0":
+    if not header:
+        print("No header received")
+        return None
+    if header[:4] != b"VXL0":
+        print(f"Invalid header magic: {header[:4]}")
         return None
     
     frame_len = struct.unpack(">I", header[4:])[0]
+    print(f"Expecting frame payload of {frame_len} bytes")
     payload = _recv_exact(conn, frame_len)
     if not payload:
+        print("No payload received")
         return None
-        
-    return cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+    
+    frame = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        print("Failed to decode frame")
+        return None
+    
+    print(f"Successfully decoded frame: {frame.shape}")
+    return frame
 
 
-def process_frame_and_update_state(frame, mode, model=None, roboflow_model=None):
+def process_frame_and_update_state(frame, mode, model=None):
     """
-    Processes a single frame using either a local model or the Roboflow API,
-    and updates the shared global state.
+    Processes a single frame using local YOLO model and updates the shared global state.
     """
-    global detection_data, latest_annotated_frame
+    # no module-level globals here; we update shared_state directly
+    print(f"Processing frame shape: {frame.shape if frame is not None else 'None'}")
 
-    if mode == 'wall_quality_api':
-        # --- NEW API PATH using roboflow + supervision ---
-        
-        # 1. Get predictions from Roboflow. The library handles the frame directly.
-        result_json = roboflow_model.predict(frame, confidence=40, overlap=30).json()
-        predictions = result_json.get('predictions', [])
-
-        # 2. Convert predictions to a supervision Detections object for easy processing.
-        detections = sv.Detections.from_roboflow(result_json)
-        
-        # 3. Create annotators to draw boxes and labels.
-        box_annotator = sv.BoxAnnotator()
-        label_annotator = sv.LabelAnnotator()
-        labels = [p['class'] for p in predictions]
-
-        # 4. Annotate the original frame with the bounding boxes and labels.
-        annotated_frame = box_annotator.annotate(scene=frame.copy(), detections=detections)
-        annotated_frame = label_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)
-
-        # 5. Generate the simple count/confidence summary for the API.
-        aggregator = defaultdict(lambda: [0.0, 0])
-        for p in predictions:
-            aggregator[p['class']][0] += p['confidence']
-            aggregator[p['class']][1] += 1
-
-        final_detections_summary = {}
-        for class_name, (conf_sum, count) in aggregator.items():
-            final_detections_summary[class_name] = {
-                "count": count, "average_confidence": conf_sum / count
-            }
-        
-        # 6. Update the global state with the new annotated frame and API data.
-        with lock:
-            latest_annotated_frame = annotated_frame.copy()
-            # The API mode does not support tracking, so it provides a simple summary.
-            detection_data = {"status": "success", "detections": final_detections_summary}
-
-    else:
-        # --- LOCAL MODEL TRACKING PATH (No changes here) ---
-        results = model.track(frame, persist=True, verbose=False) 
+    try:
+        # Process with local YOLO model
+        t0 = time.time()
+        print("Local: Running YOLO detection...")
+        results = model.predict(frame, conf=0.4, iou=0.3, verbose=False)
         result = results[0]
-        annotated_frame = result.plot()
+        dt = time.time() - t0
+        print(f"Local: Detection completed in {dt*1000:.0f}ms")
 
-        with lock:
-            latest_annotated_frame = annotated_frame.copy()
-
-        # Check if the tracker found any objects
-        if result.boxes.id is not None:
-            track_ids = result.boxes.id.int().cpu().tolist()
-            class_ids = result.boxes.cls.int().cpu().tolist()
-            boxes_xyxy = result.boxes.xyxy.cpu()
-            confs = result.boxes.conf.cpu().tolist()
-
-            for i, track_id in enumerate(track_ids):
-                # If this is a new detection, capture its image and create a record
-                if track_id not in detection_data["detections"]:
-                    x1, y1, x2, y2 = [int(coord) for coord in boxes_xyxy[i]]
-                    cropped_image = frame[y1:y2, x1:x2]
-                    _, buffer = cv2.imencode('.jpg', cropped_image)
-                    b64_image = base64.b64encode(buffer).decode('utf-8')
-                    
-                    detection_data["detections"][track_id] = {
-                        "track_id": track_id,
-                        "class_name": result.names[class_ids[i]],
-                        "first_seen_timestamp": time.time(),
-                        "last_seen_timestamp": time.time(),
-                        "confidence": confs[i],
-                        "first_image_base64": b64_image
-                    }
-                else:
-                    # Otherwise, just update existing record
-                    detection_data["detections"][track_id]["last_seen_timestamp"] = time.time()
-                    detection_data["detections"][track_id]["confidence"] = confs[i]
-
-            # Update the summary after processing the frame
-            detection_data["summary"] = {
-                "unique_total_count_seen": len(detection_data["detections"]),
-                "detections_in_current_frame": len(track_ids),
-            }
+        # Get detections and annotate frame
+        boxes = result.boxes
+        annotated_frame = frame.copy()
         
-        detection_data["status"] = "success"
+        detections_summary = defaultdict(lambda: {"count": 0, "total_conf": 0.0})
+        
+        if boxes is not None and len(boxes) > 0:
+            for box in boxes:
+                # Get box coordinates and convert to int
+                x1, y1, x2, y2 = [int(val) for val in box.xyxy[0]]
+                conf = float(box.conf[0])
+                cls = int(box.cls[0])
+                class_name = result.names[cls]
+                
+                # Draw box and label
+                color = (0, 255, 0)
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                label = f"{class_name}: {conf:.2f}"
+                cv2.putText(annotated_frame, label, (x1, y1-10), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                
+                # Update detection summary
+                detections_summary[class_name]["count"] += 1
+                detections_summary[class_name]["total_conf"] += conf
+
+        # Calculate average confidence for each class
+        final_summary = {}
+        for cls, stats in detections_summary.items():
+            final_summary[cls] = {
+                "count": stats["count"],
+                "average_confidence": stats["total_conf"] / stats["count"]
+            }
+
+        # Update shared state
+        print("Local: Updating shared state...")
+        num_boxes = len(boxes) if boxes is not None else 0
+        with shared_state.lock:
+            shared_state.latest_annotated_frame = np.ascontiguousarray(annotated_frame)
+            shared_state.detection_data = {"status": "success", "detections": final_summary}
+            print(f"Local: Frame processed and updated, found {num_boxes} objects")
+
+    except Exception as e:
+        print(f"Error processing frame: {e}")
+        with shared_state.lock:
+            shared_state.detection_data = {"status": "error", "message": str(e)}
 
 
 
 
 def video_processing_thread(mode, model=None, device_name="voxel", stream_port=9000):
     """
-    High-level orchestrator. Now initializes the full Roboflow model object if needed.
+    High-level orchestrator for video processing using local YOLO model.
     """
-    global detection_data
+    # video_processing_thread will update shared_state; no local globals needed
     transport, fs, conn = None, None, None
-    roboflow_model = None
-
-    # --- MODIFICATION: Initialize Roboflow Client for API mode ---
-    if mode == 'wall_quality_api':
-        print("Background thread: Initializing Roboflow model...")
-        # !!! IMPORTANT: Replace with YOUR private API key from Roboflow !!!
-        rf = Roboflow(api_key="9i6G8SnX8usNN9yNSJZv")
-        project = rf.workspace().project("wall-quality-detection")
-        roboflow_model = project.version(1).model
-        print("Background thread: Roboflow model initialized.")
+    frame_count = 0
+    last_fps_print = time.time()
+    
+    # Initialize display frame
+    with shared_state.lock:
+        shared_state.latest_annotated_frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        cv2.putText(shared_state.latest_annotated_frame, "Starting up...", (480, 360), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
     try:
         transport, fs, conn = setup_stream_connection(device_name, stream_port)
         while True:
+            t0 = time.time()
             frame = receive_frame(conn)
+            t_recv = time.time()
             if frame is None:
                 print("Background thread: Stream ended."); break
             
-            # Pass the mode, model, and the new roboflow_model to the processing function
-            process_frame_and_update_state(frame, mode, model=model, roboflow_model=roboflow_model)
+            process_frame_and_update_state(frame, mode, model=model)
+            t_done = time.time()
 
-            # Yield control to other threads
-            time.sleep(0.01)
+            frame_count += 1
+            if t_done - last_fps_print >= 5.0:
+                fps = frame_count / (t_done - last_fps_print)
+                print(f"FPS: {fps:.1f} (recv: {(t_recv-t0)*1000:.0f}ms, proc: {(t_done-t_recv)*1000:.0f}ms)")
+                frame_count = 0
+                last_fps_print = t_done
+
+            # Brief sleep to prevent CPU overload
+            time.sleep(0.001)
 
     except Exception as e:
         print(f"An error occurred in the background thread: {e}")
-        with lock:
-            detection_data = {"status": "error", "message": str(e), "detections": {}}
+        with shared_state.lock:
+            shared_state.detection_data = {"status": "error", "message": str(e), "detections": {}}
     finally:
         print("Background thread: Cleaning up...")
         if conn:
@@ -204,5 +195,13 @@ def video_processing_thread(mode, model=None, device_name="voxel", stream_port=9
         if fs:
             fs.stop_rdmp_stream()
         if transport and transport.is_connected():
-            transport.disconnect()
+            try:
+                transport.disconnect()
+            except RuntimeError as re:
+                # Some Ble implementations try to join the running loop thread from
+                # inside the same thread which raises RuntimeError("cannot join current thread").
+                # Ignore this in cleanup and log it.
+                print(f"Warning: transport.disconnect() raised RuntimeError during cleanup: {re}")
+            except Exception as ex:
+                print(f"Warning: transport.disconnect() failed during cleanup: {ex}")
         print("Background thread: Disconnected and shut down.")
