@@ -175,7 +175,7 @@ def video_processing_thread(mode, model=None, device_name="voxel", stream_port=9
     if mode == 'wall_quality_api':
         print("Background thread: Initializing Roboflow model...")
         # !!! IMPORTANT: Replace with YOUR private API key from Roboflow !!!
-        rf = Roboflow(api_key="YOUR_ROBOFLOW_API_KEY_HERE")
+        rf = Roboflow(api_key="9i6G8SnX8usNN9yNSJZv")
         project = rf.workspace().project("wall-quality-detection")
         roboflow_model = project.version(1).model
         print("Background thread: Roboflow model initialized.")
